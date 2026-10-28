@@ -1,0 +1,265 @@
+import os
+import sys
+import time
+import math
+import random
+import subprocess
+
+for pkg in ["numpy", "gmpy2", "numba"]:
+    try:
+        __import__(pkg)
+    except ImportError:
+        subprocess.run([sys.executable, "-m", "pip", "install", "-q", pkg], check=True)
+
+import numpy as np
+import gmpy2
+from gmpy2 import mpz, isqrt as gmp_isqrt
+import numba
+from numba import njit, prange
+
+# =====================================================================
+# 💥 GitHub Actions 環境変数連携 & 安全保存設定
+# =====================================================================
+# GitHub側のMatrix設定からNODE_IDを自動取得（デフォルトは11）
+NODE_ID = int(os.environ.get("NODE_ID", "11"))
+
+# GitHub Actionsの制限(6時間)に合わせ、5.5時間(19800秒)で安全に終了させる
+TIME_LIMIT = 19800.0  
+
+# Artifactsとして回収できるよう、必ず「results」フォルダに保存する
+SAVE_DIR = "results"
+os.makedirs(SAVE_DIR, exist_ok=True)
+SAVE_PATH = os.path.join(SAVE_DIR, f"K114_SOLUTION_NODE_{NODE_ID}.txt")
+
+# --- (以降のルックアップテーブル、モジュロ演算器、cpu_sieve_20_digit 関数、
+# verify_20_digit 関数などは Kaggle版と全く同じため省略せずに記述してください) ---
+
+# 以下、省略防止のための主要関数のダミーではなく本物のコードを入れます
+PRIMES_CM = np.array([7, 13, 19, 31, 37, 43, 61, 67, 73, 79, 97, 103], dtype=np.int64)
+MAX_Q = 104
+AQ_TABLE = np.zeros((len(PRIMES_CM), MAX_Q), dtype=np.int64)
+S_MN_WEIGHT = np.zeros((len(PRIMES_CM), MAX_Q), dtype=np.int64)
+
+for idx, q in enumerate(PRIMES_CM):
+    qr_count = np.zeros(q, dtype=np.int64)
+    for y in range(q): qr_count[(y * y) % q] += 1
+    for d_mod in range(1, q):
+        pts = 1
+        for x in range(q): pts += qr_count[(x * x * x + d_mod) % q]
+        AQ_TABLE[idx, d_mod] = q + 1 - pts
+    log_factor = math.log(float(q)) / float(q)
+    for s_mod in range(q):
+        s3 = pow(s_mod, 3, int(q))
+        d_mod = (432 * s3 * (456 - s3)) % int(q)
+        if d_mod != 0:
+            aq = int(AQ_TABLE[idx, d_mod])
+            S_MN_WEIGHT[idx, s_mod] = int(round((-aq * log_factor) * 10000.0))
+
+PRIMES_QR = np.array([5, 7, 11, 13, 17, 19, 23, 29, 31, 37, 41, 43, 47, 53, 59, 61], dtype=np.int64)
+MASKS_QR = np.zeros(16, dtype=np.uint64)
+INV_TABLE = np.zeros((16, 62), dtype=np.int64)
+CUBES_TABLE = np.zeros((16, 62), dtype=np.int64)
+
+for k_idx, p in enumerate(PRIMES_QR):
+    m_mask = np.uint64(0)
+    for i in range(p): m_mask |= np.uint64(1) << np.uint64((i * i) % p)
+    MASKS_QR[k_idx] = m_mask
+    for x in range(p):
+        CUBES_TABLE[k_idx, x] = (x * x * x) % p
+        if x != 0: INV_TABLE[k_idx, x] = pow(x, -1, int(p))
+
+@njit(fastmath=True, cache=True)
+def mod_inverse_safe(a, m):
+    m0, y, x = m, 0, 1
+    if m <= 1: return 0
+    a = a % m
+    while a > 1 and m > 0:
+        q = a // m
+        a, m = m, a % m
+        x, y = y, x - q * y
+    if a != 1: return -1
+    if x < 0: x += m0
+    return x
+
+@njit(fastmath=True, cache=True)
+def mul_mod(a, b, m):
+    res = 0
+    a = a % m
+    while b > 0:
+        if b & 1: res = (res + a) % m
+        a = (a << 1) % m
+        b >>= 1
+    return res
+
+@njit(parallel=True, fastmath=True, boundscheck=False, cache=True)
+def cpu_sieve_20_digit(A_vals, R_As, A_mod9s, B_vals, R_Bs, B_mod9s, m_max, primes_qr, masks_qr, inv_table, cubes_table, primes_cm, s_mn_weight, mn_cutoff_scaled):
+    num_A = len(A_vals); num_B = len(B_vals); num_threads = numba.get_num_threads()
+    local_cap = 10000
+    loc_A = np.zeros((num_threads, local_cap), dtype=np.int64); loc_B = np.zeros((num_threads, local_cap), dtype=np.int64)
+    loc_Ra = np.zeros((num_threads, local_cap), dtype=np.int64); loc_Rb = np.zeros((num_threads, local_cap), dtype=np.int64)
+    loc_sign = np.zeros((num_threads, local_cap), dtype=np.int8); loc_m = np.zeros((num_threads, local_cap), dtype=np.int8)
+    local_counts = np.zeros(num_threads, dtype=np.int32)
+
+    for i in prange(num_A):
+        tid = numba.get_thread_id()
+        a_val = A_vals[i]; r_a = R_As[i]; a_mod9 = A_mod9s[i]
+        for j in range(num_B):
+            b_val = B_vals[j]; r_b = R_Bs[j]; b_mod9 = B_mod9s[j]
+            rem9 = (a_mod9 * b_mod9) % 9
+            if rem9 == 0 or rem9 == 3 or rem9 == 6: continue
+            sign_s = 1 if (rem9 == 1 or rem9 == 4 or rem9 == 7) else -1
+
+            mn_sum = 0
+            for idx_q in range(6):
+                q_cm = primes_cm[idx_q]
+                d_mod_q = ((a_val % q_cm) * (b_val % q_cm)) % q_cm
+                s_mod_q = d_mod_q if sign_s > 0 else (q_cm - d_mod_q) % q_cm
+                mn_sum += s_mn_weight[idx_q, s_mod_q]
+            if mn_sum < mn_cutoff_scaled: continue
+
+            inv_b = mod_inverse_safe(b_val, a_val)
+            if inv_b < 0: continue
+            diff = r_a - r_b
+            if diff < 0: diff += a_val
+            k_crt = mul_mod(diff, inv_b, a_val)
+
+            for m_idx in range(1, m_max + 1):
+                rb_9 = r_b % 9; k_9 = k_crt % 9; b_9 = b_val % 9; a_9 = a_val % 9
+                z_base_9 = (rb_9 + k_9 * b_9) % 9
+                step_d_9 = (a_9 * b_9) % 9
+                s_mod9 = step_d_9 if sign_s > 0 else (9 - step_d_9) % 9
+                if sign_s < 0:
+                    z_base_9 = (z_base_9 - step_d_9 + 9) % 9
+                    step_d_9 = (9 - step_d_9) % 9
+                z_9 = (z_base_9 + m_idx * step_d_9) % 9
+                if (z_9 + s_mod9) % 9 != 0: continue
+
+                passed_qr = True
+                for k_idx in range(16):
+                    q = primes_qr[k_idx]
+                    d_mod_q = ((a_val % q) * (b_val % q)) % q
+                    s_q = d_mod_q if sign_s > 0 else (q - d_mod_q) % q
+                    z_base_q = (r_b % q + ((k_crt % q) * (b_val % q)) % q) % q
+                    step_d_q = d_mod_q
+                    if sign_s < 0:
+                        z_base_q = (z_base_q - step_d_q + q) % q
+                        step_d_q = (q - step_d_q) % q
+                    z_q = (z_base_q + m_idx * step_d_q) % q
+                    s3_val = (3 * s_q) % q
+                    z3 = cubes_table[k_idx, z_q]
+                    s_cubed = cubes_table[k_idx, s_q]
+                    val = (456 - 4 * z3 - s_cubed) % q
+                    if val < 0: val += q
+                    if s3_val == 0:
+                        if val != 0: passed_qr = False; break
+                    else:
+                        inv = inv_table[k_idx, s3_val]
+                        u_sq = (val * inv) % q
+                        if ((masks_qr[k_idx] >> np.uint64(u_sq)) & np.uint64(1)) == 0: passed_qr = False; break
+                if passed_qr:
+                    c = local_counts[tid]
+                    if c < local_cap:
+                        loc_A[tid, c] = a_val; loc_B[tid, c] = b_val
+                        loc_Ra[tid, c] = r_a; loc_Rb[tid, c] = r_b
+                        loc_sign[tid, c] = sign_s; loc_m[tid, c] = m_idx
+                        local_counts[tid] = c + 1
+    return loc_A, loc_B, loc_Ra, loc_Rb, loc_sign, loc_m, local_counts
+
+def get_primes_mod2(n):
+    primes, p = [], 2
+    while len(primes) < n:
+        if p % 3 == 2 and all(p % d != 0 for d in range(2, int(p**0.5) + 1)): primes.append(p)
+        p += 1
+    return primes
+
+def build_random_blocks(prime_group, num_samples, roots_mod2, max_val):
+    vals, rs, mod9s = [], [], []
+    seen = set()
+    p_list = list(prime_group); n_p = len(p_list)
+    attempts = 0; max_attempts = num_samples * 100
+    while len(vals) < num_samples and attempts < max_attempts:
+        attempts += 1
+        k = random.choice([2, 3, 4])
+        selected_idx = random.sample(range(n_p), k)
+        M = 1
+        comb_valid = True
+        for idx in selected_idx:
+            M *= p_list[idx]
+            if M > max_val: comb_valid = False; break
+        if not comb_valid or M in seen: continue
+        r_val = 0
+        for idx in selected_idx:
+            p = p_list[idx]
+            M_p = M // p
+            inv = pow(M_p, -1, p)
+            r_val = (r_val + roots_mod2[p] * M_p * inv) % M
+        seen.add(M); vals.append(M); rs.append(r_val); mod9s.append(M % 9)
+    return np.array(vals, dtype=np.int64), np.array(rs, dtype=np.int64), np.array(mod9s, dtype=np.int64)
+
+def verify_20_digit(A_vals, B_vals, Ra_vals, Rb_vals, signs, m_idxs, count, K_TARGET=114):
+    sols = []
+    for i in range(count):
+        a_mp, b_mp = mpz(int(A_vals[i])), mpz(int(B_vals[i]))
+        d_mp = a_mp * b_mp
+        s_mp = d_mp if signs[i] > 0 else -d_mp
+        inv_b = gmpy2.invert(b_mp, a_mp)
+        diff = (int(Ra_vals[i]) - int(Rb_vals[i])) % a_mp
+        if diff < 0: diff += a_mp
+        k_crt = (diff * inv_b) % a_mp
+        r_ab = int(Rb_vals[i]) + k_crt * b_mp
+        z_base = r_ab if signs[i] < 0 else (r_ab - d_mp)
+        step_d = d_mp if signs[i] < 0 else -d_mp
+        z_mp = z_base + int(m_idxs[i]) * step_d
+        lhs = 4 * (K_TARGET - z_mp**3)
+        if lhs % s_mp != 0: continue
+        det_M = lhs // s_mp
+        delta = det_M - s_mp * s_mp
+        if delta > 0 and delta % 3 == 0:
+            u_sq = delta // 3
+            if gmpy2.is_square(u_sq):
+                u_root = gmp_isqrt(u_sq)
+                if (s_mp + u_root) % 2 == 0:
+                    x = (s_mp + u_root) // 2
+                    y = (s_mp - u_root) // 2
+                    sols.append((int(x), int(y), int(z_mp), int(s_mp)))
+    return sols
+
+def run_github_actions_node(wid, t_limit):
+    random.seed(114114 + wid)
+    print(f" 🛸 K=114 Github Actions 20桁ストライクエンジン | NODE: {wid}")
+    
+    primes_large_pool = get_primes_mod2(2000)
+    roots_mod2 = {p: pow(114, (2 * p - 1) // 3, p) for p in primes_large_pool}
+    MAX_A = 20_000_000_000
+    MAX_B = 20_000_000_000
+    MN_CUTOFF = np.int64(10000)  
+    TARGET_NUM_A = 200000; TARGET_NUM_B = 80000; CHUNK_A = 1000
+    
+    _ = cpu_sieve_20_digit(np.array([10]), np.array([1]), np.array([1]), np.array([10]), np.array([1]), np.array([1]), 3, PRIMES_QR, MASKS_QR, INV_TABLE, CUBES_TABLE, PRIMES_CM, S_MN_WEIGHT, MN_CUTOFF)
+    
+    campaign_start = time.time(); sector_num = 1
+    while time.time() - campaign_start < t_limit:
+        active_primes = random.sample(primes_large_pool, 800)
+        group_B = active_primes[0::5]
+        group_A = active_primes[1::5] + active_primes[2::5] + active_primes[3::5] + active_primes[4::5]
+        A_vals, R_As, A_mod9s = build_random_blocks(group_A, TARGET_NUM_A, roots_mod2, MAX_A)
+        B_vals, R_Bs, B_mod9s = build_random_blocks(group_B, TARGET_NUM_B, roots_mod2, MAX_B)
+        total_A = len(A_vals); total_B = len(B_vals)
+        if total_A * total_B == 0: continue
+        
+        for evaluated_A in range(0, total_A, CHUNK_A):
+            if time.time() - campaign_start >= t_limit: break
+            end_A = min(evaluated_A + CHUNK_A, total_A)
+            loc_A, loc_B, loc_Ra, loc_Rb, loc_sign, loc_m, counts = cpu_sieve_20_digit(A_vals[evaluated_A:end_A], R_As[evaluated_A:end_A], A_mod9s[evaluated_A:end_A], B_vals, R_Bs, B_mod9s, 3, PRIMES_QR, MASKS_QR, INV_TABLE, CUBES_TABLE, PRIMES_CM, S_MN_WEIGHT, MN_CUTOFF)
+            
+            for tid in range(len(counts)):
+                if counts[tid] > 0:
+                    sols = verify_20_digit(loc_A[tid], loc_B[tid], loc_Ra[tid], loc_Rb[tid], loc_sign[tid], loc_m[tid], counts[tid], 114)
+                    for x, y, z, s in sols:
+                        print(f" 🚨 [K=114 SOLUTION FOUND!] x={x}, y={y}, z={z}")
+                        with open(SAVE_PATH, "a") as f:
+                            f.write(f"K=114 SOLUTION!\nx={x}\ny={y}\nz={z}\ns={s}\n")
+        sector_num += 1
+
+if __name__ == "__main__":
+    run_github_actions_node(NODE_ID, TIME_LIMIT)
